@@ -3,16 +3,68 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn.utils.rnn import PackedSequence
 import torch.nn.functional as F
+from torch.nn.modules import Adaptive
 
 from fairseq.models import (FairseqEncoder, FairseqDecoder)
+from helpers import initEmbedding, initLSTM, initLinear
 from fairseq import utils
 from fairseq.data import Dictionary
 from typing import Tuple
 from helpers import create_mask, len_to_mask
+from fairseq.modules import AdaptiveSoftmax
 
 import torch.utils
 
 class DistractorEncoder(FairseqEncoder):
+    def __init__(
+        self, dictionary: Dictionary, embed_dim=512, hidden_size=512, num_layers=1,
+        dropout_in=0.1, dropout_out=0.1, bidirectional=False,
+        left_pad=True, pretrained_embed=None, padding_value=0.,
+    ):
+        super().__init__(dictionary)
+        self.num_layers = num_layers
+        self.dropout_in = dropout_in
+        self.dropout_out = dropout_out
+        self.bidirectional = bidirectional
+        self.hidden_size = hidden_size
+
+        num_embeddings = len(dictionary)
+        self.padding_idx = dictionary.pad()
+        if pretrained_embed is None:
+            self.embed_tokens = initEmbedding(num_embeddings, embed_dim, self.padding_idx)
+        else:
+            self.embed_tokens = pretrained_embed
+
+        self.lstm = initLSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=self.dropout_out if num_layers > 1 else 0.,
+            bidirectional=bidirectional,
+        )
+        self.lstm_second = initLSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=self.dropout_out if num_layers > 1 else 0.,
+            bidirectional=bidirectional,
+        )
+        self.left_pad = left_pad
+        self.padding_value = padding_value
+
+        self.output_units = hidden_size
+        if bidirectional:
+            self.output_units *= 2
+
+        self.attention = Attention()
+        self.dropout = nn.Dropout(dropout_in)
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(self.output_units*2, self.output_units),
+            nn.Tanh()
+        )
+        self.distance_layer = nn.Bilinear(self.output_units, self.output_units, 1)
+        self.gating_layer = nn.Linear(self.output_units, 1)
+        self.relu = nn.ReLU()
     def __init__(this, dictionary,
                  embed_dim: int=512, hidden_size: int=512, num_layers: int=1,
                  dropout_out: float=0.1, dropout_in: float=0.1, bidirectional: bool=False,
@@ -64,16 +116,7 @@ class DistractorEncoder(FairseqEncoder):
             x = this.dropout(x)
         else: 
             x = tokens
-        print("Embedds", x.shape)
 
-        """ Probably not needed in latest fairseq
-        if this.left_padding:
-            x_length_sorted, x_indices = torch.sort(lengths, descending=True)
-            x_sorted = x.index_select(dim=0, index=x_indices)
-            _, x_original_indices = torch.sort(x_indices)
-        else:
-            x_length_sorted, x_sorted = lengths, x
-        """
         x_length_sorted, x_indices = torch.sort(lengths, descending=True)
         x_sorted = x.index_select(dim=0, index=x_indices)
         _, x_original_indices = torch.sort(x_indices)
@@ -107,10 +150,12 @@ class DistractorEncoder(FairseqEncoder):
             final_cell_state = this.combine_bidirectional(final_cell_state, batch_size)
 
         return x, final_hidden_state, final_cell_state # Return the input sequence, the calculation of hidden state and cell state
+    
     def combine_bidirectional(this, outputs: Tensor, batch_size: int) -> Tensor:
         out: Tensor = outputs.view(this.num_layers, 2, batch_size, -1).transpose(1, 2).contiguous() # [num_layers, batch_size, 2, hidden_size]
         return out.view(this.num_layers, batch_size, -1) #[num_layers, batch_size, hidden_size], It combined the result of bidirectional
-
+    
+    
     def forward(this, source_tokens: Tensor, source_lengths: Tensor,
                 question_tokens: Tensor, question_lengths: Tensor,
                 answer_tokens: Tensor, answer_lengths: Tensor):
@@ -190,8 +235,6 @@ class DistractorEncoder(FairseqEncoder):
             distractor_self_attention.repeat(1, source_sequence_max_len, 1))
         
         related_part_of_source_with_the_distractor_and_question = x_source * distractor_source_qa_distance
-        print("Rpq",related_part_of_question_with_the_answer.shape)
-        print("rps",related_part_of_source_with_the_distractor_and_question.shape)
 
         ##### Finding relevant part within the context given a related question with the true answer ONLY AND 
         # not distractors
@@ -216,8 +259,14 @@ class DistractorEncoder(FairseqEncoder):
         source_final_outs, source_final_hidden, source_final_cell = this.encode_text(fusion_related_part_of_source_with_all_components, source_lengths,
                                                                                             required_embed=False, required_sort=False)
 
-        print(question_final_outs.shape)
-        print(source_final_outs.shape)
+        decoder_question_mask_for_self_attention = len_to_mask(question_lengths, question_sequence_max_len)
+        #return question_final_outs, source_final_outs
+        
+        return {
+            "encoder_out": (source_final_outs, source_final_hidden, source_final_cell,
+                             question_final_outs, question_final_hidden, question_final_cell,),
+            "encoder_padding_mask": decoder_question_mask_for_self_attention,
+        }
 
 
     def gate_self_attention(this, sequences: Tensor, mask: Tensor=None):
@@ -238,9 +287,115 @@ class DistractorEncoder(FairseqEncoder):
         return int(1e5)
         
 
-
 class DistractorDecoder(FairseqDecoder):
-    ...
+    def __init__(this, dictionary,
+                 embed_dim: int=512,
+                 hidden_size: int=512,
+                 out_embed_dim: int = 512,
+                 num_layers: int=1,
+                 dropout_in: float=0.1,
+                 dropout_out: float=0.1,
+                 attention: bool = True,
+                 encoder_output_units=512,
+                 pretrained_embed = None,
+                 share_input_output_embed=False,
+                 adaptive_softmax_cutoff=None,
+                 proj_initial_state=False):
+        super().__init__(dictionary=dictionary)
+
+        this.hidden_size = hidden_size
+        this.embed_dim = embed_dim
+        this.share_input_output_embedding = share_input_output_embed
+
+        this.dropout_in = dropout_in
+        this.dropout_out = dropout_out
+
+        this.adaptive_softmax = None
+        this.num_embeddings = len(dictionary)
+        this.need_attention = True
+        this.padding_indx = dictionary.pad()
+
+        this.encoder_output_units = encoder_output_units
+        if this.encoder_output_units != hidden_size:
+            this.encoder_hidden_projector = initLinear(encoder_output_units, hidden_size)
+            this.encoder_cell_projector = initLinear(encoder_output_units, hidden_size)
+        else:
+            this.encoder_hidden_projector = None
+            this.encoder_cell_projector = None
+
+
+        if pretrained_embed is None:
+            this.embed_tokens = initEmbedding(this.num_embeddings, this.embed_dim,
+                                              this.padding_indx)
+        else:
+            this.embed_tokens = pretrained_embed
+
+        if attention:
+            this.attention = AttentionLayer(this.hidden_size,
+                                            this.encoder_output_units,
+                                            this.hidden_size)
+        else:
+            this.attention = None
+
+        if adaptive_softmax_cutoff is not None:
+            this.adaptive_softmax = AdaptiveSoftmax(this.num_embeddings,
+                                                    this.hidden_size,
+                                                    adaptive_softmax_cutoff, 
+                                                    dropout=dropout_out)
+        elif this.share_input_output_embedding == False:
+            this.fc_out = initLinear(out_embed_dim, this.num_embeddings)
+        
+        this.match_layer = nn.Bilinear(hidden_size, hidden_size, 1)
+        this.gate_layer = nn.Sequential(
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+
+        this.relu =  nn.ReLU()
+
+        this.project_initial_state = proj_initial_state
+        if this.project_initial_state:
+            this.project_hiddens = initLinear(encoder_output_units, encoder_output_units)
+            this.project_cells = initLinear(encoder_output_units, encoder_output_units)
+    def forward(this, prev_output_tokens: Tuple, encoder_out: Tuple, incremental_state=None):
+        ...
+
+
+class AttentionLayer(nn.Module):
+    def __init__(this, input_embedding_dim: Tensor,
+                 source_embedding_dim: Tensor,
+                 output_embedding_dim: Tensor,
+                 bias=False):
+        this.input_projector = initLinear(input_embedding_dim, source_embedding_dim, bias=bias)
+        this.output_projector = initLinear(input_embedding_dim + source_embedding_dim, output_embedding_dim, bias=bias)
+
+    def forward(this, input: Tensor,
+                 source_hidden: Tensor,
+                 encoder_padding_mask: Tensor):
+        #input [batch_size, source_embedding_dim]
+        #source_hidden [src_len, batch_size, output_embed_dim]
+        #encoder_pad_mask [batch_size, src_len, hidden_size]
+        
+        #x1 [batch_size, source_embedding_dim]
+        x1: Tensor = this.input_projector(input)
+
+        attention_score = (source_hidden * x1.unsqueeze(0)).sum(dim=2) #-->[src_len, batch_size] #the represent the attention score for each sentence
+        if encoder_padding_mask is not None:
+            attention_score = attention_score.float().masked_fill_(encoder_padding_mask, 7e-5).type_as(attention_score)
+        
+        attention_score = F.softmax(attention_score, dim=0) # Porque src_len,batch_size consist the valeur of the attention, softmax will get the probability for each sentence
+        # The probability is related with the source or the given context
+
+        ## As the attention score now is the size of [src_len, batch_size] each of the observation consist the 
+        ## probability for each sentence given the context.
+        
+        ## Now we would like to element-wise this probability with their corresponding source hidden
+        ## attention_score[src_len, batch_size, 1] --> [src_len, batch_size, hidden_size]
+        ## Result --> [batch_size, hidden_size]
+
+        x1 = (attention_score.unsqueeze(dim=2) * source_hidden).sum(dim=0)
+        output = torch.tanh(this.output_projector(torch.cat([x1, input], dim=1)))
+        return output, attention_score
 
 class Attention(nn.Module):
 

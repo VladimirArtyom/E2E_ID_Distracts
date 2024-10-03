@@ -1,11 +1,12 @@
 import unittest
 import torch
 from torch import Tensor
+import random
+import numpy as np
 
 from custom_layers import DistractorEncoder
 from backup_2 import DGEncoder
 from fairseq.data import Dictionary
-torch.random.manual_seed(1)
 
 def define_dictionary() -> Dictionary:
     d = Dictionary()
@@ -21,13 +22,16 @@ def define_dictionary() -> Dictionary:
 
 class TestDistractorEncoder(unittest.TestCase):
     def setUp(this):
+        torch.manual_seed(0)
+        random.seed(0)
+        np.random.seed(0)
         dictionary = define_dictionary()
         this.embed_dim=300
-        this.hidden_size=150
+        this.hidden_size=300
         this.batch_size = 5
         this.num_layers=1
-        this.dropout_out=0.1
-        this.dropout_in=0.1
+        this.dropout_out=0
+        this.dropout_in=0
         this.bidirectional=False
         this.left_pad=False
         this.pretrained_embed=None
@@ -45,6 +49,16 @@ class TestDistractorEncoder(unittest.TestCase):
                                          pretrained_embed=this.pretrained_embed,
                                          padding_value=this.padding_value
                                          )
+        this.cEncoder = DistractorEncoder(dictionary,
+                                        embed_dim=this.embed_dim,
+                                         hidden_size=this.hidden_size,
+                                         num_layers=this.num_layers,
+                                         dropout_out=this.dropout_out,
+                                         dropout_in=this.dropout_in,
+                                         bidirectional=this.bidirectional,
+                                         left_pad=this.left_pad,
+                                         pretrained_embed=this.pretrained_embed,
+                                         padding_value=this.padding_value)
     @unittest.skip(reason="")
     def test_encode_text(this):
         tokens = torch.tensor([
@@ -106,8 +120,15 @@ class TestDistractorEncoder(unittest.TestCase):
         source_lengths: Tensor = torch.tensor([3, 2, 3, 5, 5])
         question_lengths: Tensor = torch.tensor([3, 2, 4, 5, 5])
         answer_lengths: Tensor = torch.tensor([3, 2, 3, 5, 5])
-        this.encoder.forward(source_tokens, source_lengths,
+        this.encoder.eval()
+        this.cEncoder.eval()
+        q,a = this.encoder.forward(source_tokens, source_lengths,
                               question_tokens, question_lengths,
                                 answer_tokens, answer_lengths)
+        qc, ac = this.cEncoder.forward(source_tokens, source_lengths,
+                                        question_tokens, question_lengths,
+                                          answer_tokens, answer_lengths)
+        #assert q.shape ==  qc.shape
+        #assert a.shape == ac.shape
 if __name__ == "__main__":
     unittest.main()
